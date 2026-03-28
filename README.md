@@ -2,7 +2,7 @@
 
 MapGAN is a deliberately tiny world-map approximator.
 
-It does not try to reproduce coastlines directly. Instead, it treats the land mask as a hypothesis made from a small number of rotated, wrapped Gaussian blobs on an equirectangular grid. The solver sweeps from simpler to more complex hypotheses, scores each one against a downloaded target map, and reports the result as a measure rather than a pass/fail gate.
+It does not try to reproduce coastlines directly. Instead, it treats the land mask as a hypothesis made from a small number of rotated, wrapped Gaussian blobs on an equirectangular grid. The solver sweeps from simpler to more complex hypotheses, locally refines the best candidate at each size, then compresses the strongest large model back downward to find denser approximations.
 
 Search happens on a coarser grid. Verification happens on a higher-resolution grid. That gives the project an explicit overfit signal: if the coarse-grid score keeps improving while the verified score stops improving and begins to fall, the sweep can stop automatically.
 
@@ -10,9 +10,11 @@ Search happens on a coarser grid. Verification happens on a higher-resolution gr
 
 - Downloads a public world-country GeoJSON and rasterizes it into a land mask.
 - Searches for a compact approximation using `N` blobs plus one bias term.
+- Refines each winning candidate with a coordinate hill-climb.
+- Compresses the strongest large model by pruning blobs and re-refining, which improves both score and density.
 - Measures each hypothesis with IoU, F1, accuracy, precision, and recall.
 - Verifies each complexity on a higher-resolution raster and can stop automatically on overfit.
-- Saves preview images, diff images, and JSON model files into `out/`.
+- Saves preview images, diff images, JSON model files, and a Pareto-style dense frontier into `out/`.
 
 ## Install
 
@@ -47,3 +49,6 @@ Verify a saved model explicitly:
 - There is no required threshold. The leaderboard is the point.
 - Overfit detection compares the best verified IoU seen so far against later blob counts. By default, the sweep stops when the search-grid IoU keeps improving, the verified IoU has dropped by at least `0.003`, and that pattern has persisted for `4` consecutive blob counts after at least `6` blobs.
 - If you want a pure fixed-range sweep, run `mapgan.py solve --no-stop-on-overfit`.
+- `out/best_overall.json` is the strongest verified model found after sweep plus compression.
+- `out/best_dense.json` is the smallest model on the Pareto frontier that still retains at least `92%` of the best verified IoU.
+- `out/leaderboard.json` now includes the raw sweep, the compression pass, and the Pareto frontier summary.

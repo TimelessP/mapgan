@@ -62,6 +62,10 @@ class Candidate:
         return cls(float(payload.get("bias", 0.0)), blob_array)
 
 
+def count_params(candidate: Candidate) -> int:
+    return 1 + (6 * candidate.blobs.shape[0])
+
+
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(exist_ok=True)
     OUT_DIR.mkdir(exist_ok=True)
@@ -209,6 +213,28 @@ def mutate_candidate(candidate: Candidate, rng: np.random.Generator, scale: floa
     return child
 
 
+def perturb_candidate(candidate: Candidate, index: int, delta: float) -> Candidate:
+    child = candidate.copy()
+    if index == 0:
+        child.bias = float(np.clip(child.bias + delta, -3.0, 3.0))
+        return child
+    blob_index, blob_param = divmod(index - 1, 6)
+    blob = child.blobs[blob_index]
+    if blob_param == 0:
+        blob[0] = wrap_longitude(float(blob[0] + delta))
+    elif blob_param == 1:
+        blob[1] = float(np.clip(blob[1] + delta, -88.0, 88.0))
+    elif blob_param == 2:
+        blob[2] = float(np.clip(blob[2] * math.exp(delta), 2.5, 95.0))
+    elif blob_param == 3:
+        blob[3] = float(np.clip(blob[3] * math.exp(delta), 2.0, 70.0))
+    elif blob_param == 4:
+        blob[4] = wrap_angle(float(blob[4] + delta))
+    else:
+        blob[5] = clamp_amp(float(blob[5] + delta))
+    return child
+
+
 def render_mask(candidate: Candidate, grid) -> np.ndarray:
     lon_grid, lat_grid, cos_lat = grid
     field = np.full(lon_grid.shape, candidate.bias, dtype=np.float32)
@@ -243,7 +269,118 @@ def score_mask(mask: np.ndarray, target: np.ndarray) -> dict:
     }
 
 
-def optimize(target: np.ndarray, grid, blob_count: int, seed: int, population: int, steps: int, warm_start: Candidate | None) -> tuple[Candidate, dict]:
+def refine_candidate(candidate: Candidate, target: np.ndarray, grid, refine_passes: int) -> tuple[Candidate, dict]:
+    best_candidate = candidate.copy()
+    best_metrics = score_mask(render_mask(best_candidate, grid), target)
+    if refine_passes <= 0:
+        return best_candidate, best_metrics
+    step_sizes = [
+        0.28,
+        14.0,
+        7.0,
+        0.22,
+        0.22,
+        0.32,
+        0.18,
+    ]
+    parameter_count = 1 + (6 * best_candidate.blobs.shape[0])
+    for refine_pass in range(refine_passes):
+        scale = 0.55 ** refine_pass
+        improved = False
+        for parameter_index in range(parameter_count):
+            base_step = step_sizes[0] if parameter_index == 0 else step_sizes[1 + ((parameter_index - 1) % 6)]
+            delta = base_step * scale
+            for direction in (-1.0, 1.0):
+                trial = perturb_candidate(best_candidate, parameter_index, direction * delta)
+                metrics = score_mask(render_mask(trial, grid), target)
+                if metrics["iou"] > best_metrics["iou"]:
+                    best_candidate = trial
+                    best_metrics = metrics
+                    improved = True
+                    break
+            if improved:
+                continue
+        if not improved:
+            break
+    return best_candidate, best_metrics
+
+
+def compress_candidate(
+    candidate: Candidate,
+    search_target: np.ndarray,
+    search_grid,
+    verify_target: np.ndarray,
+    verify_grid,
+    min_blobs: int,
+    refine_passes: int,
+) -> list[dict]:
+    current = candidate.copy()
+    rows = []
+    compression_passes = max(1, refine_passes // 2)
+    while True:
+        search_metrics = score_mask(render_mask(current, search_grid), search_target)
+        verify_metrics = score_mask(render_mask(current, verify_grid), verify_target)
+        rows.append(
+            {
+                "blobs": int(current.blobs.shape[0]),
+                "params": count_params(current),
+                "search": search_metrics,
+                "verify": verify_metrics,
+                "generalization_gap": float(search_metrics["iou"] - verify_metrics["iou"]),
+                "status": "compressed",
+                "candidate": current.copy(),
+            }
+        )
+        if current.blobs.shape[0] <= min_blobs:
+            break
+        best_trial = None
+        best_search_metrics = None
+        best_verify_metrics = None
+        for remove_index in range(current.blobs.shape[0]):
+            trial = current.copy()
+            trial.blobs = np.delete(trial.blobs, remove_index, axis=0)
+            trial, trial_search_metrics = refine_candidate(trial, search_target, search_grid, compression_passes)
+            trial_verify_metrics = score_mask(render_mask(trial, verify_grid), verify_target)
+            if best_verify_metrics is None:
+                best_trial = trial
+                best_search_metrics = trial_search_metrics
+                best_verify_metrics = trial_verify_metrics
+                continue
+            trial_score = (trial_verify_metrics["iou"], trial_verify_metrics["accuracy"], -count_params(trial))
+            best_score = (best_verify_metrics["iou"], best_verify_metrics["accuracy"], -count_params(best_trial))
+            if trial_score > best_score:
+                best_trial = trial
+                best_search_metrics = trial_search_metrics
+                best_verify_metrics = trial_verify_metrics
+        assert best_trial is not None
+        current = best_trial
+    return rows
+
+
+def build_pareto_frontier(rows: list[dict]) -> list[dict]:
+    frontier = []
+    best_verify_iou = float("-inf")
+    for row in sorted(rows, key=lambda item: (item["params"], item["blobs"], -item["verify"]["iou"])):
+        if row["verify"]["iou"] > best_verify_iou + 1e-12:
+            frontier.append(row)
+            best_verify_iou = row["verify"]["iou"]
+    return frontier
+
+
+def strip_candidate(row: dict) -> dict:
+    return {key: value for key, value in row.items() if key != "candidate"}
+
+
+def optimize(
+    target: np.ndarray,
+    grid,
+    blob_count: int,
+    seed: int,
+    population: int,
+    steps: int,
+    refine_passes: int,
+    warm_start: Candidate | None,
+) -> tuple[Candidate, dict]:
     rng = np.random.default_rng(seed)
     target_land_fraction = float(target.mean())
     current_population = []
@@ -281,6 +418,7 @@ def optimize(target: np.ndarray, grid, blob_count: int, seed: int, population: i
             next_population.append(random_candidate(blob_count, rng, target_land_fraction))
         current_population = next_population
 
+    best_candidate, best_metrics = refine_candidate(best_candidate, target, grid, refine_passes)
     return best_candidate, best_metrics
 
 
@@ -306,6 +444,12 @@ def clean_solve_outputs() -> None:
         "best_*.json",
         "best_*_*.png",
         "best_*_diff.png",
+        "compressed_*.json",
+        "compressed_*_*.png",
+        "compressed_*_diff.png",
+        "best_dense.json",
+        "best_dense.png",
+        "best_dense_diff.png",
         "best_overall.png",
         "best_overall_diff.png",
         "best_overall_verify.png",
@@ -400,6 +544,7 @@ def cmd_solve(args: argparse.Namespace) -> None:
             seed=args.seed + (blob_count * 1009),
             population=args.population,
             steps=args.steps,
+            refine_passes=args.refine_passes,
             warm_start=warm_start,
         )
         warm_start = candidate
@@ -432,12 +577,13 @@ def cmd_solve(args: argparse.Namespace) -> None:
 
         row = {
             "blobs": blob_count,
-            "params": 1 + (6 * blob_count),
+            "params": count_params(candidate),
             "search": search_metrics,
             "verify": verify_metrics,
             "generalization_gap": float(search_metrics["iou"] - verify_metrics["iou"]),
             "status": status,
             "model": model_path.name,
+            "candidate": candidate.copy(),
         }
         rows.append(row)
 
@@ -465,21 +611,57 @@ def cmd_solve(args: argparse.Namespace) -> None:
                 break
 
     assert best_overall is not None
+    compression_rows = []
+    if args.compress_best and best_overall.blobs.shape[0] > args.compress_min_blobs:
+        compression_rows = compress_candidate(
+            candidate=best_overall,
+            search_target=search_target,
+            search_grid=search_grid,
+            verify_target=render_target,
+            verify_grid=render_grid,
+            min_blobs=max(args.min_blobs, args.compress_min_blobs),
+            refine_passes=args.refine_passes,
+        )
+        for row in compression_rows:
+            blob_count = row["blobs"]
+            model_path = OUT_DIR / f"compressed_{blob_count:02d}.json"
+            preview_mask = render_mask(row["candidate"], search_grid)
+            save_mask_png(preview_mask, OUT_DIR / f"compressed_{blob_count:02d}_{args.search_width}x{args.search_height}.png")
+            save_diff_png(preview_mask, search_target, OUT_DIR / f"compressed_{blob_count:02d}_diff.png")
+            write_json(model_path, row["candidate"].to_dict())
+            row["model"] = model_path.name
+            if row["verify"]["iou"] > best_verify_metrics["iou"]:
+                best_overall = row["candidate"].copy()
+                best_verify_metrics = row["verify"]
+                best_verify_search_metrics = row["search"]
+                best_verify_blob_count = blob_count
+
     if stopping["reason"] == "max-blobs-reached":
         stopping["blob_count"] = rows[-1]["blobs"]
         stopping["best_verify_blob_count"] = best_verify_blob_count
     render_mask_best = render_mask(best_overall, render_grid)
     render_metrics = score_mask(render_mask_best, render_target)
 
+    combined_rows = rows + compression_rows
+    frontier = build_pareto_frontier(combined_rows)
+    best_dense = next(
+        row for row in frontier if row["verify"]["iou"] >= (render_metrics["iou"] * args.dense_fraction)
+    )
+    best_dense_mask = render_mask(best_dense["candidate"], render_grid)
+
     save_mask_png(render_mask_best, OUT_DIR / "best_overall.png")
     save_diff_png(render_mask_best, render_target, OUT_DIR / "best_overall_diff.png")
     write_json(OUT_DIR / "best_overall.json", best_overall.to_dict())
+    save_mask_png(best_dense_mask, OUT_DIR / "best_dense.png")
+    save_diff_png(best_dense_mask, render_target, OUT_DIR / "best_dense_diff.png")
+    write_json(OUT_DIR / "best_dense.json", best_dense["candidate"].to_dict())
 
     report = {
         "search_resolution": [args.search_width, args.search_height],
         "render_resolution": [args.render_width, args.render_height],
         "population": args.population,
         "steps": args.steps,
+        "refine_passes": args.refine_passes,
         "seed": args.seed,
         "target_url": args.target_url,
         "stop_on_overfit": args.stop_on_overfit,
@@ -488,18 +670,24 @@ def cmd_solve(args: argparse.Namespace) -> None:
         "overfit_verify_delta": args.overfit_verify_delta,
         "overfit_patience": args.overfit_patience,
         "overfit_min_blobs": args.overfit_min_blobs,
-        "results": rows,
+        "compress_best": args.compress_best,
+        "compress_min_blobs": args.compress_min_blobs,
+        "dense_fraction": args.dense_fraction,
+        "results": [strip_candidate(row) for row in rows],
+        "compression": [strip_candidate(row) for row in compression_rows],
+        "pareto_frontier": [strip_candidate(row) for row in frontier],
         "best_search_metrics": best_search_metrics,
         "best_search_blob_count": best_search_blob_count,
         "best_verify_metrics": best_verify_metrics,
         "best_verify_blob_count": best_verify_blob_count,
         "best_verify_search_metrics": best_verify_search_metrics,
         "best_render_metrics": render_metrics,
+        "best_dense": strip_candidate(best_dense),
         "stopping": stopping,
     }
     write_json(OUT_DIR / "leaderboard.json", report)
     print_leaderboard(rows)
-    print(json.dumps({"best_render_metrics": render_metrics, "stopping": stopping, "outputs": str(OUT_DIR)}, indent=2))
+    print(json.dumps({"best_render_metrics": render_metrics, "best_dense": strip_candidate(best_dense), "stopping": stopping, "outputs": str(OUT_DIR)}, indent=2))
 
 
 def cmd_verify(args: argparse.Namespace) -> None:
@@ -529,6 +717,7 @@ def build_parser() -> argparse.ArgumentParser:
     solve.add_argument("--max-blobs", type=int, default=48)
     solve.add_argument("--population", type=int, default=48)
     solve.add_argument("--steps", type=int, default=24)
+    solve.add_argument("--refine-passes", type=int, default=4)
     solve.add_argument("--seed", type=int, default=7)
     solve.add_argument("--search-width", type=int, default=128)
     solve.add_argument("--search-height", type=int, default=64)
@@ -540,6 +729,9 @@ def build_parser() -> argparse.ArgumentParser:
     solve.add_argument("--overfit-verify-delta", type=float, default=0.003)
     solve.add_argument("--overfit-patience", type=int, default=4)
     solve.add_argument("--overfit-min-blobs", type=int, default=6)
+    solve.add_argument("--compress-best", action=argparse.BooleanOptionalAction, default=True)
+    solve.add_argument("--compress-min-blobs", type=int, default=6)
+    solve.add_argument("--dense-fraction", type=float, default=0.92)
     solve.add_argument("--target-url", default=TARGET_URL)
     solve.add_argument("--refresh", action="store_true")
     solve.set_defaults(func=cmd_solve)

@@ -24,7 +24,7 @@ fi
 PYTHON_BIN="$ROOT_DIR/.venv/bin/python"
 
 echo "==> Installing pinned runtime"
-"$PYTHON_BIN" -m pip install --upgrade "numpy==2.4.3" "Pillow==11.3.0"
+"$PYTHON_BIN" -m pip install --upgrade "numpy==2.4.3" "Pillow==12.1.1"
 
 echo "==> Fetching target map"
 "$PYTHON_BIN" mapgan.py fetch-target \

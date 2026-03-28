@@ -1,4 +1,9 @@
 .venv/
-data/
-out/
 __pycache__/
+data/*
+!data/countries.geo.json
+out/*
+!out/best_overall.json
+!out/best_overall.png
+!out/best_overall_diff.png
+!out/target_256x128.png
